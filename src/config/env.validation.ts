@@ -98,6 +98,15 @@ export const envValidationSchema = Joi.object({
   // Sentry DSN for error alerting.  Omit (or leave blank) to disable Sentry.
   SENTRY_DSN: Joi.string().uri().allow("").default(""),
 
+  // Bearer token that guards GET /metrics (issue #298).
+  // When set, Prometheus scrape jobs must supply:
+  //   Authorization: Bearer <METRICS_TOKEN>
+  // When empty (the default):
+  //   - non-production: unauthenticated scraping allowed (local dev Prometheus)
+  //   - production: endpoint returns 401 (fail-closed — set the token before deploying)
+  // Generate with: openssl rand -hex 32
+  METRICS_TOKEN: Joi.string().allow("").default(""),
+
   // Winston log level.  Defaults to "debug" in dev/test and "info" in production.
   LOG_LEVEL: Joi.string()
     .valid("error", "warn", "info", "http", "verbose", "debug", "silly")
