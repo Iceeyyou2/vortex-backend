@@ -121,6 +121,26 @@ Solvers must maintain a collateral bond in the Soroban `SolverRegistryContract` 
 - **Minimum Bond Requirement**: Solvers cannot accept high-value intents without adequate active collateral.
 - **On-Chain Settlement**: Bond balances are recorded on-chain via the Soroban contract and synchronized with the backend registry.
 
+### Bond and Exposure Checks on Acceptance
+Every accept request verifies the solver's bond amount and active status against
+the registry contract through a read-only Soroban simulation. A successful
+result is cached for at most 30 seconds and registry bond/activity events
+invalidate the cache. If the registry RPC, contract, or response is unavailable,
+the API fails closed with `503`; the projected `bondAmount` in the backend
+solver record is not used as a substitute.
+
+The backend values the intent's source amount in USD using integer arithmetic
+and enforces this ceiling before the state transition:
+
+> accepted exposure in USD + new intent value in USD ≤ on-chain bond value in USD × `maxExposureRatio`
+
+`maxExposureRatio` is the current governance parameter. Stellar bond amounts are
+interpreted in 7-decimal XLM base units and valued using the configured XLM USD
+price. An intent price snapshot older than five minutes, a missing/non-positive
+price, or malformed amount fails closed with `503`. An intent exceeding the
+remaining capacity is rejected with `403` and error code `INSUFFICIENT_BOND`.
+Bond top-ups remain an on-chain operation and are outside this API flow.
+
 ### Reputation & Bond Reconciliation
 A solver's active reputation score is continuously computed using completion rates and account age:
 $$\text{ReputationScore} = \text{SuccessRate} \times e^{-\frac{\text{AgeInDays}}{180}}$$
@@ -190,11 +210,23 @@ This transitions the intent state from `open` to `accepted` and assigns the solv
 {
   "solver": "GBCW6A5K76DMT5Y55LVTG62W4VRV5L45I2N374X63P3V...",
   "fillAmount": "1000000",
-  "txHash": "0xabc123...",
+  "txHash": "64-character Stellar transaction hash",
   "signature": "base64EncodedSignatureOverFillMessage=="
 }
 ```
-This transitions the intent state to `filled`.
+The backend checks the transaction through Horizon before it transitions the intent to `filled`.
+The transaction must be successful, carry a text memo equal to the intent UUID, and contain
+a matching payment to the intent's Stellar user in the configured destination asset. Path
+payments are credited using `destination_amount`; the submitted `fillAmount` is not used as
+the protocol credit amount. Transactions not indexed yet remain pending and the solver may
+retry the same hash. The hash is reserved to one intent by a database unique index.
+
+**Current verification boundary:** classic Horizon `payment` and strict-send/strict-receive
+path-payment operations are supported. Soroban `invoke_host_function` transfer events are
+not yet verified, so SAC transfers submitted through contract invocation are rejected as
+having no matching payment.
+The current solver lifecycle still uses `isActive`; probation, bond verification, automatic
+promotion/suspension, and SLA digests are not implemented by this change.
 
 ---
 

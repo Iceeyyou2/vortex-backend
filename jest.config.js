@@ -26,6 +26,9 @@ module.exports = {
       // Exclude the scripts sub-suite so tests aren't picked up twice.
       testPathIgnorePatterns: ["/scripts/"],
       collectCoverageFrom: ["**/*.(t|j)s"],
+      moduleNameMapper: {
+        "^@nestjs/schedule$": "<rootDir>/../test/__mocks__/nestjs-schedule.ts",
+      },
     },
 
     // ── Scripts suite (ledger-utils, etc.) ─────────────────────────────────

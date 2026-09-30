@@ -2,7 +2,6 @@ import {
   Inject,
   Injectable,
   Logger,
-  OnModuleDestroy,
   Optional,
   ServiceUnavailableException,
 } from "@nestjs/common";
@@ -24,8 +23,9 @@ import { SHADOW_TRANSITIONS, type ShadowTransition } from "../soroban/shadow.typ
 import { MetricsService } from "../metrics/metrics.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { ProtocolParamsService } from "../governance/params.service";
+import { FeatureFlagService } from "../flags/feature-flag.service";
+import { IntentDeadlineScheduler } from "./intents-deadline.jobs";
 
-const STORE_SIZE_LOG_INTERVAL_MS = 60_000;
 const TERMINAL_STATES: IntentState[] = ["filled", "cancelled", "expired", "slashed"];
 
 /**
@@ -78,7 +78,7 @@ export const MAX_OPEN_INTENTS_PER_USER = 50;
  * (in-memory ↔ Prisma) without touching this service or anything above it.
  */
 @Injectable()
-export class IntentsService implements OnModuleDestroy {
+export class IntentsService {
   private readonly logger = new Logger(IntentsService.name);
 
   /**
@@ -104,14 +104,13 @@ export class IntentsService implements OnModuleDestroy {
    */
   private readonly auditLog = new Map<string, IntentAuditEntry[]>();
 
-  private readonly sizeLogTimer: ReturnType<typeof setInterval>;
-
   constructor(
     @Inject(INTENTS_REPOSITORY)
     private readonly repo: IIntentsRepository,
     private readonly configService: ConfigService<AppConfig, true>,
     private readonly stellarTxService: StellarTxService,
     private readonly prisma: PrismaService,
+    private readonly protocolParamsService: ProtocolParamsService,
     /**
      * Shadow-mode divergence monitor (issue #401).
      *
@@ -131,22 +130,17 @@ export class IntentsService implements OnModuleDestroy {
      * this is always present.
      */
     @Optional() private readonly metricsService?: MetricsService,
-    private readonly protocolParamsService: ProtocolParamsService,
-  ) {
-    const sweepMs = Number(this.configService.get("intentRetentionSweepMs", { infer: true }) ?? STORE_SIZE_LOG_INTERVAL_MS);
-    this.sizeLogTimer = setInterval(() => this.logStoreSize(), sweepMs || STORE_SIZE_LOG_INTERVAL_MS);
-    // Allow the process to exit even if the timer is still active.
-    this.sizeLogTimer.unref?.();
-  }
-
-  onModuleDestroy() {
-    clearInterval(this.sizeLogTimer);
-  }
+    @Optional() private readonly flags?: FeatureFlagService,
+    @Optional() private readonly deadlines?: IntentDeadlineScheduler,
+  ) {}
 
   /**
    * Logs the store size and evicts stale terminal intents from the in-memory
    * adapter when it is the active backend. This keeps the memory footprint
    * bounded without affecting on-chain or durable storage paths.
+   *
+   * Runs as the `intents.store-size` background job (see
+   * intents-maintenance.jobs.ts, issue #494) rather than a local timer.
    */
   async logStoreSize(): Promise<void> {
     const evicted = await this.evictTerminalIntents();
@@ -262,11 +256,20 @@ export class IntentsService implements OnModuleDestroy {
       paramsVersion: paramsSnapshot.version,
     };
 
-    if (this.configService.get("onchainIntentsEnabled", { infer: true })) {
+    // ONCHAIN_INTENTS_ENABLED is the default; the `onchain-intents-enabled`
+    // runtime flag (issue #495) can roll it out per chain / percentage.
+    const onchain = this.flags
+      ? await this.flags.getBooleanValue("onchain-intents-enabled", {
+          targetingKey: intent.intentId,
+          chain: intent.srcChain,
+        })
+      : this.configService.get("onchainIntentsEnabled", { infer: true });
+    if (onchain) {
       await this.registerOnChain(intent);
     }
 
     await this.repo.save(intent);
+    this.deadlines?.scheduleExpire(intent);
     // Creation is the entry edge of the funnel: the `vortex:intent:*` recording
     // rules count transitions *into* each state, so without this the intent
     // dashboard would start every conversion ratio from zero. `from_state` is
@@ -513,11 +516,40 @@ export class IntentsService implements OnModuleDestroy {
     const fillWindow =
       CHAIN_FILL_WINDOW_DEFAULTS[intent.srcChain] ?? DEFAULT_FILL_WINDOW_SECONDS;
     const updated = await this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec);
-    if (updated !== null) this.countTransition("open", "accepted");
+    if (updated !== null) {
+      this.countTransition("open", "accepted");
+      this.deadlines?.scheduleFillWindow(updated);
+    }
     if (this.beginShadowObservation()) {
       this.observeAccept(updated ?? intent, solver, updated !== null);
     }
     return updated;
+  }
+
+  /** Accept only when this solver remains below the configured exposure cap. */
+  async acceptIfOpenWithinExposure(
+    id: string,
+    solver: string,
+    candidateExposureUsdMicros: bigint,
+    maxExposureUsdMicros: bigint,
+    now = Math.floor(Date.now() / 1000),
+  ): Promise<{ intent: Intent | null; exposureExceeded: boolean }> {
+    const intent = await this.repo.findById(id);
+    if (!intent) return { intent: null, exposureExceeded: false };
+    const fillWindow = this.protocolParamsService.snapshotForChain(intent.srcChain).fillWindowSeconds;
+    const result = await this.repo.acceptIfOpenWithinExposure(
+      id,
+      solver,
+      now + fillWindow,
+      now,
+      candidateExposureUsdMicros,
+      maxExposureUsdMicros,
+    );
+    if (result.intent !== null) this.countTransition("open", "accepted");
+    if (this.beginShadowObservation()) {
+      this.observeAccept(result.intent ?? intent, solver, result.intent !== null);
+    }
+    return result;
   }
 
   /** Shadow hook for `accept` — reported whether or not the conditional write won. */
@@ -533,9 +565,6 @@ export class IntentsService implements OnModuleDestroy {
         nativeToScVal(intent.deadline, { type: "u64" }),
       ]),
     );
-    const snapshot = this.protocolParamsService.snapshotForChain(intent.srcChain);
-    const fillWindow = snapshot.fillWindowSeconds;
-    return this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec);
   }
 
   /**
@@ -654,6 +683,7 @@ export class IntentsService implements OnModuleDestroy {
       // corrupt, so skip the simulation rather than encoding a null address —
       // the sweep loop already logs that case loudly.
       if (subject?.solver) {
+        const solver = subject.solver;
         this.reportShadow(
           "slash",
           subject.intentId,
@@ -661,9 +691,9 @@ export class IntentsService implements OnModuleDestroy {
           "slash_intent",
           this.safeArgs(() => [
             nativeToScVal(subject.intentId, { type: "string" }),
-            new Address(subject.solver).toScVal(),
-            nativeToScVal(patch.slashReason, { type: "string" }),
-            nativeToScVal(patch.slashedAt, { type: "u64" }),
+            new Address(solver).toScVal(),
+            nativeToScVal(patch.slashReason ?? "", { type: "string" }),
+            nativeToScVal(patch.slashedAt ?? 0, { type: "u64" }),
           ]),
         );
       }
@@ -678,7 +708,9 @@ export class IntentsService implements OnModuleDestroy {
    * or already has a later deadline.
    */
   async extendDeadlineIfAccepted(id: string, newDeadline: number): Promise<Intent | null> {
-    return this.repo.extendDeadlineIfAccepted(id, newDeadline);
+    const updated = await this.repo.extendDeadlineIfAccepted(id, newDeadline);
+    if (updated) this.deadlines?.scheduleFillWindow(updated);
+    return updated;
   }
 
   // ---------------------------------------------------------------------------

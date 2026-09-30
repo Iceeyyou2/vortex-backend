@@ -1,9 +1,22 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { ConflictException, Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { SupportedChain } from "../intents/intents.types";
 import { SOLVERS_REPOSITORY, ISolversRepository } from "./solvers.repository";
 import { SolverRecord, SolverPendingPenalty } from "./solvers.types";
+import { GuardianStateService } from "../governance/guardian-state.service";
 
 export type LeaderboardWindow = "24h" | "7d" | "30d" | "all";
+
+export function solverSupports(
+  solver: Pick<SolverRecord, "supportedChains" | "supportedTokens">,
+  chain: SupportedChain | string,
+  token: string,
+): boolean {
+  if (!solver.supportedChains.includes(chain as SupportedChain) && chain !== "*") {
+    return false;
+  }
+  const normalizedToken = token.toUpperCase();
+  return solver.supportedTokens.some((supportedToken) => supportedToken.toUpperCase() === normalizedToken);
+}
 
 export interface SlashDisputeRecord {
   submittedAt: number;
@@ -49,7 +62,16 @@ export class SolversService {
   constructor(
     @Inject(SOLVERS_REPOSITORY)
     private readonly repo: ISolversRepository,
+    @Optional() private readonly guardian?: GuardianStateService,
   ) {}
+
+  /**
+   * True while an active guardian blacklist covers `address` (issue #507).
+   * Derived from guardian state; operators cannot clear it by reactivating.
+   */
+  isSuspended(address: string): boolean {
+    return this.guardian?.isSolverSuspended(address) ?? false;
+  }
 
   async getAll(): Promise<SolverRecord[]> {
     return this.repo.findAll();
@@ -137,6 +159,9 @@ export class SolversService {
   }
 
   async reactivate(address: string): Promise<SolverRecord | null> {
+    if (this.isSuspended(address)) {
+      throw new ConflictException("Solver is suspended by an active guardian action");
+    }
     const solver = await this.repo.findByAddress(address);
     if (!solver) return null;
     const updated = { ...solver, isActive: true };
@@ -201,16 +226,6 @@ export class SolversService {
   }
 
   /**
-   * Records that a solver successfully filled an intent.
-   * Increments fillsCompleted and updates lastActiveAt.
-   */
-  async recordSuccessfulFill(address: string): Promise<SolverRecord | null> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return null;
-    const updated = {
-      ...solver,
-      fillsCompleted: solver.fillsCompleted + 1,
-      lastActiveAt: Math.floor(Date.now() / 1000),
    * Records a successful fill for `address`.
    *
    * Bumps `fillsCompleted`, adds `fillAmount` to the cumulative `totalVolume`,
@@ -341,9 +356,22 @@ export class SolversService {
    * investigate the discrepancy.
    *
    * @param intentId  The intent whose slash submission failed.
+   * @param solverAddress  Optional fallback for callers that track the
+   *   penalty durably (the slashing saga, issue #397): when the in-memory
+   *   pending entry is gone — e.g. lost in a restart — the fillsFailed
+   *   increment is still reverted for this solver. Callers passing it must
+   *   guarantee they compensate at most once per intent.
    */
-  async rollbackPenalty(intentId: string): Promise<SolverRecord | null> {
+  async rollbackPenalty(intentId: string, solverAddress?: string): Promise<SolverRecord | null> {
     const penalty = this.pendingPenalties.get(intentId);
+    if (!penalty && solverAddress) {
+      const solver = await this.repo.findByAddress(solverAddress);
+      if (!solver) return null;
+      this.logger.warn(
+        `[penalty] rolled back without in-memory record: solver=${solverAddress} intent=${intentId}`,
+      );
+      return this.repo.save({ ...solver, fillsFailed: Math.max(0, solver.fillsFailed - 1) });
+    }
     if (!penalty || penalty.state !== "pending") {
       this.logger.warn(
         `rollbackPenalty called for intentId=${intentId} but no pending penalty found (state=${penalty?.state ?? "none"})`,
@@ -413,6 +441,15 @@ export class SolversService {
       pageSize,
       total: sorted.length,
     };
+  }
+
+  /** Look up a slash by its id across all solvers (used by the dispute flow). */
+  async getSlash(slashId: string): Promise<SlashRecord | null> {
+    for (const records of this.slashHistory.values()) {
+      const found = records.find((entry) => entry.slashId === slashId);
+      if (found) return found;
+    }
+    return null;
   }
 
   async submitDispute(
