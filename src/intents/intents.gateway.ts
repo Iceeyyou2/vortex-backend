@@ -28,6 +28,12 @@ import { randomUUID } from "node:crypto";
 export type { SequencedEvent } from "./backplane/backplane.types";
 export { EventRingBuffer } from "./event-ring-buffer";
 
+/** Read WS_HEARTBEAT_INTERVAL_MS from the environment, falling back to 30 s. */
+function resolveHeartbeatIntervalMs(): number {
+  const parsed = Number(process.env.WS_HEARTBEAT_INTERVAL_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : HEARTBEAT_INTERVAL_MS;
+}
+
 /**
  * WebSocket adapter over the transport-agnostic {@link IntentFeedService}
  * (issue #433).
@@ -51,7 +57,6 @@ export class IntentsGateway
   private readonly authenticatedSolver = new WeakMap<WebSocket, string>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private heartbeatTimer: any;
-
   private readonly wsConfig: AppConfig["ws"];
   private readonly jwtSecret: string;
 
@@ -59,6 +64,14 @@ export class IntentsGateway
   private readonly backplane: Backplane;
   /** Serialises local delivery so events reach clients in `seq` order. */
   private deliveryChain: Promise<void> = Promise.resolve();
+
+  private nextSeq = 1;
+
+  /** Configured heartbeat interval in milliseconds (default 30 000). */
+  public readonly heartbeatIntervalMs: number;
+
+  /** Number of connections terminated in the most recent heartbeat cycle. */
+  private lastHeartbeatTerminatedCount = 0;
 
   /** Ring buffer storing the last REPLAY_BUFFER_SIZE broadcast events. */
   private readonly ringBuffer = new EventRingBuffer(REPLAY_BUFFER_SIZE);
@@ -82,7 +95,16 @@ export class IntentsGateway
     const defaults = configuration();
     this.wsConfig = config?.get("ws", { infer: true }) ?? defaults.ws;
     this.jwtSecret = config?.get("authJwtSecret", { infer: true }) ?? defaults.authJwtSecret;
-    this.heartbeatTimer = setInterval(() => this.heartbeat(), HEARTBEAT_INTERVAL_MS);
+    this.heartbeatIntervalMs = resolveHeartbeatIntervalMs();
+    this.heartbeatTimer = setInterval(() => this.heartbeat(), this.heartbeatIntervalMs);
+    this.backplane = this.createBackplane();
+    if (this.backplane) {
+      this.backplane.subscribe((event) => {
+        const type = typeof event.type === "string" ? event.type : "";
+        if (!type) return;
+        this.dispatchRemoteEvent(event as Record<string, unknown>);
+      });
+    }
     logger.info(`ws heartbeat started (backplane=${this.feed.backplaneHealth().mode})`);
   }
 
@@ -885,10 +907,12 @@ export class IntentsGateway
   }
 
   private heartbeat() {
+    let terminated = 0;
     for (const [client, feedClient] of this.feedClients) {
       if (!feedClient.alive) {
         client.terminate();
         this.removeSubscriber(client);
+        terminated++;
         logger.debug(
           `ws heartbeat terminated dead client (subscribers=${this.feed.connectionCount})`,
         );
@@ -900,6 +924,46 @@ export class IntentsGateway
         client.ping();
       }
     }
+    this.lastHeartbeatTerminatedCount = terminated;
+    if (terminated > 0) {
+      logger.debug(
+        `ws heartbeat terminated ${terminated} dead client(s) (subscribers=${this.subscribers.size})`,
+      );
+    }
+        continue;
+      }
+
+      feedClient.alive = false;
+      if (client.readyState === WebSocket.OPEN) {
+        client.ping();
+      }
+    }
+    this.lastHeartbeatTerminatedCount = terminated;
+    if (terminated > 0) {
+      logger.debug(
+        `ws heartbeat terminated ${terminated} dead client(s) (subscribers=${this.subscribers.size})`,
+      );
+    }
+  }
+
+  /**
+   * Returns the number of connections terminated in the most recent
+   * heartbeat cycle. Useful for presence stats and observability.
+   */
+  getLastTerminatedCount(): number {
+    return this.lastHeartbeatTerminatedCount;
+  }
+
+  /**
+   * Returns the number of connections that missed the last ping and are
+   * waiting to be terminated in the next heartbeat cycle ("zombies").
+   */
+  getZombieCount(): number {
+    let count = 0;
+    for (const client of this.subscribers.keys()) {
+      if (this.alive.get(client) === false) count++;
+    }
+    return count;
   }
 
   async onModuleDestroy() {
