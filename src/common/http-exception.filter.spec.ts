@@ -124,4 +124,73 @@ describe("HttpExceptionFilter", () => {
       expect(json).toHaveBeenCalledWith({ error: "boom" });
     });
   });
+
+  // ── issue #304: custom-shaped body allowlist ───────────────────────────────
+  describe("custom-shaped body allowlist (issue #304)", () => {
+    it("passes through the known-safe fields (error, intentId, minDstAmount, fillAmount)", () => {
+      const host = makeHost(json);
+      const { BadRequestException } = require("@nestjs/common");
+      filter.catch(
+        new BadRequestException({
+          error: "fill amount below minimum",
+          intentId: "abc-123",
+          minDstAmount: "100",
+          fillAmount: "90",
+        }),
+        host,
+      );
+      expect(json).toHaveBeenCalledWith({
+        error: "fill amount below minimum",
+        intentId: "abc-123",
+        minDstAmount: "100",
+        fillAmount: "90",
+      });
+    });
+
+    it("strips unknown fields that are not in the allowlist", () => {
+      const host = makeHost(json);
+      const { BadRequestException } = require("@nestjs/common");
+      filter.catch(
+        new BadRequestException({
+          error: "something went wrong",
+          intentId: "abc-123",
+          internalDebugField: "stack trace here",
+          dbId: 42,
+        }),
+        host,
+      );
+      const body = json.mock.calls[0][0];
+      expect(body.error).toBe("something went wrong");
+      expect(body.intentId).toBe("abc-123");
+      expect(body).not.toHaveProperty("internalDebugField");
+      expect(body).not.toHaveProperty("dbId");
+    });
+
+    it("propagates requestId on a custom-shaped body", () => {
+      const host = makeHost(json, "req-xyz-456");
+      const { BadRequestException } = require("@nestjs/common");
+      filter.catch(
+        new BadRequestException({ error: "fill amount below minimum", intentId: "abc-123" }),
+        host,
+      );
+      expect(json).toHaveBeenCalledWith({
+        error: "fill amount below minimum",
+        intentId: "abc-123",
+        requestId: "req-xyz-456",
+      });
+    });
+
+    it("omits undefined allowlisted fields from the response", () => {
+      const host = makeHost(json);
+      const { BadRequestException } = require("@nestjs/common");
+      filter.catch(
+        new BadRequestException({ error: "generic error" }),
+        host,
+      );
+      const body = json.mock.calls[0][0];
+      expect(body).not.toHaveProperty("intentId");
+      expect(body).not.toHaveProperty("minDstAmount");
+      expect(body).not.toHaveProperty("fillAmount");
+    });
+  });
 });

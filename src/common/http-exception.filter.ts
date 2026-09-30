@@ -57,8 +57,24 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
         // Custom-shaped bodies passed directly to an exception constructor,
         // e.g. new BadRequestException({ error: "...", fillAmount, minDstAmount })
+        //
+        // Audit note (issue #304): rather than passing the raw body verbatim we
+        // extract only the fields that are intentionally public.  The allowlist
+        // is deliberately narrow — every new field a caller wants to surface to
+        // the client must be added here explicitly, which makes "what can leak?"
+        // answerable with a single grep.
+        //
+        // Kept fields:
+        //   error          — the human-readable error description (always safe)
+        //   intentId       — identifies the affected intent (safe to return)
+        //   minDstAmount   — data-integrity constraint value (safe to return)
+        //   fillAmount     — solver-supplied fill amount (safe to return)
         if (typeof b.error === "string" && !b.statusCode) {
-          response.status(status).json(b);
+          const safeBody: Record<string, unknown> = { error: b.error };
+          if (b.intentId !== undefined) safeBody.intentId = b.intentId;
+          if (b.minDstAmount !== undefined) safeBody.minDstAmount = b.minDstAmount;
+          if (b.fillAmount !== undefined) safeBody.fillAmount = b.fillAmount;
+          response.status(status).json(addRequestId(safeBody, requestId));
           return;
         }
 

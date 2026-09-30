@@ -94,6 +94,28 @@ export const envValidationSchema = Joi.object({
   SOLVER_ADDRESS: Joi.string().allow("").default(""),
   SOLVER_CHAINS: Joi.string().allow("").default(""),
 
+  // ── Metrics endpoint access control (issue #298) ─────────────────────────
+  // Bearer token required for GET /metrics. When empty, the endpoint is
+  // disabled entirely (returns 403) to prevent accidental public exposure.
+  // Generate with: openssl rand -hex 32
+  // Required (non-empty, min 16 chars) in production so the operational
+  // surface is never left open to the public internet.
+  METRICS_TOKEN: Joi.when("NODE_ENV", {
+    is: "production",
+    then: Joi.string().min(16).required().messages({
+      "string.empty":
+        "METRICS_TOKEN must be a non-empty secret in production. " +
+        "Generate one with `openssl rand -hex 32`.",
+      "string.min":
+        "METRICS_TOKEN must be at least 16 characters in production. " +
+        "Generate one with `openssl rand -hex 32`.",
+      "any.required":
+        "METRICS_TOKEN is required in production to protect the /metrics endpoint. " +
+        "Generate one with `openssl rand -hex 32`.",
+    }),
+    otherwise: Joi.string().allow("").default(""),
+  }),
+
   // ── Observability ─────────────────────────────────────────────────────────
   // Sentry DSN for error alerting.  Omit (or leave blank) to disable Sentry.
   SENTRY_DSN: Joi.string().uri().allow("").default(""),

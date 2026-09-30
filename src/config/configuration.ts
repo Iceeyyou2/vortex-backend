@@ -214,6 +214,12 @@ export interface AppConfig {
     /** Heartbeat interval in ms (default 5000). */
     heartbeatMs: number;
   };
+  /**
+   * Bearer token for GET /metrics (issue #298).
+   * Empty string means "disabled" — the endpoint returns 403 until a token
+   * is configured. Required and validated as non-empty in production.
+   */
+  metricsToken: string;
 }
 
 export default (): AppConfig => ({
@@ -283,6 +289,7 @@ export default (): AppConfig => ({
     enabled: (process.env.LEADER_ELECTION_ENABLED ?? "false") === "true",
     heartbeatMs: parseInt(process.env.LEADER_ELECTION_HEARTBEAT_MS ?? "5000", 10),
   },
+  metricsToken: process.env.METRICS_TOKEN ?? "",
 });
 
 /** Parse `SHADOW_SAMPLE_RATE` into a probability, defaulting to full sampling. */
