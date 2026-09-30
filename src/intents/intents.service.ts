@@ -2,7 +2,6 @@ import {
   Inject,
   Injectable,
   Logger,
-  OnModuleDestroy,
   Optional,
   ServiceUnavailableException,
 } from "@nestjs/common";
@@ -10,7 +9,7 @@ import { ConfigService } from "@nestjs/config";
 import { v4 as uuidv4 } from "uuid";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { Intent, IntentAuditEntry, IntentState } from "./intents.types";
-import { INTENTS_REPOSITORY, IIntentsRepository } from "./intents.repository";
+import { INTENTS_REPOSITORY, IIntentsRepository, IntentSearchQuery, IntentSearchResult } from "./intents.repository";
 import { AppConfig } from "../config/configuration";
 import {
   CHAIN_DEADLINE_DEFAULTS,
@@ -24,8 +23,8 @@ import { SHADOW_TRANSITIONS, type ShadowTransition } from "../soroban/shadow.typ
 import { MetricsService } from "../metrics/metrics.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { ProtocolParamsService } from "../governance/params.service";
+import { FeatureFlagService } from "../flags/feature-flag.service";
 
-const STORE_SIZE_LOG_INTERVAL_MS = 60_000;
 const TERMINAL_STATES: IntentState[] = ["filled", "cancelled", "expired", "slashed"];
 
 /**
@@ -53,6 +52,31 @@ function isKnownShadowTransition(transition: ShadowTransition): boolean {
 const IDEMPOTENCY_TTL_SECONDS = 86_400; // 24 hours
 
 /**
+ * Compute the USD value of a base-unit amount at a given token price (issue #440).
+ *
+ * Uses integer arithmetic for the amount (BigInt) so large base-unit values do
+ * not lose precision before the float conversion; the price is scaled to 1e8
+ * to keep the multiplication in integer space.  Returns `undefined` when the
+ * price is unknown — historical rows are never backfilled with fabricated
+ * values.
+ */
+function computeUsdValue(
+  srcAmount: string,
+  decimals: number,
+  priceUsd: number | undefined,
+): number | undefined {
+  if (priceUsd === undefined || priceUsd === null || !Number.isFinite(priceUsd)) return undefined;
+  try {
+    const amount = BigInt(srcAmount);
+    const scale = 10n ** BigInt(decimals);
+    const scaled = amount * BigInt(Math.round(priceUsd * 1e8));
+    return Number(scaled / (scale * 100_000_000n));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Maximum number of simultaneously open (state = "open" | "accepted") intents
  * allowed per user address.
  *
@@ -78,7 +102,7 @@ export const MAX_OPEN_INTENTS_PER_USER = 50;
  * (in-memory ↔ Prisma) without touching this service or anything above it.
  */
 @Injectable()
-export class IntentsService implements OnModuleDestroy {
+export class IntentsService {
   private readonly logger = new Logger(IntentsService.name);
 
   /**
@@ -104,14 +128,13 @@ export class IntentsService implements OnModuleDestroy {
    */
   private readonly auditLog = new Map<string, IntentAuditEntry[]>();
 
-  private readonly sizeLogTimer: ReturnType<typeof setInterval>;
-
   constructor(
     @Inject(INTENTS_REPOSITORY)
     private readonly repo: IIntentsRepository,
     private readonly configService: ConfigService<AppConfig, true>,
     private readonly stellarTxService: StellarTxService,
     private readonly prisma: PrismaService,
+    private readonly protocolParamsService: ProtocolParamsService,
     /**
      * Shadow-mode divergence monitor (issue #401).
      *
@@ -131,22 +154,16 @@ export class IntentsService implements OnModuleDestroy {
      * this is always present.
      */
     @Optional() private readonly metricsService?: MetricsService,
-    private readonly protocolParamsService: ProtocolParamsService,
-  ) {
-    const sweepMs = Number(this.configService.get("intentRetentionSweepMs", { infer: true }) ?? STORE_SIZE_LOG_INTERVAL_MS);
-    this.sizeLogTimer = setInterval(() => this.logStoreSize(), sweepMs || STORE_SIZE_LOG_INTERVAL_MS);
-    // Allow the process to exit even if the timer is still active.
-    this.sizeLogTimer.unref?.();
-  }
-
-  onModuleDestroy() {
-    clearInterval(this.sizeLogTimer);
-  }
+    @Optional() private readonly flags?: FeatureFlagService,
+  ) {}
 
   /**
    * Logs the store size and evicts stale terminal intents from the in-memory
    * adapter when it is the active backend. This keeps the memory footprint
    * bounded without affecting on-chain or durable storage paths.
+   *
+   * Runs as the `intents.store-size` background job (see
+   * intents-maintenance.jobs.ts, issue #494) rather than a local timer.
    */
   async logStoreSize(): Promise<void> {
     const evicted = await this.evictTerminalIntents();
@@ -260,9 +277,18 @@ export class IntentsService implements OnModuleDestroy {
       createdAt: now,
       deadline: defaultDeadline,
       paramsVersion: paramsSnapshot.version,
+      usdValueAtCreate: computeUsdValue(data.srcAmount, data.srcToken.decimals, data.srcToken.priceUSD),
     };
 
-    if (this.configService.get("onchainIntentsEnabled", { infer: true })) {
+    // ONCHAIN_INTENTS_ENABLED is the default; the `onchain-intents-enabled`
+    // runtime flag (issue #495) can roll it out per chain / percentage.
+    const onchain = this.flags
+      ? await this.flags.getBooleanValue("onchain-intents-enabled", {
+          targetingKey: intent.intentId,
+          chain: intent.srcChain,
+        })
+      : this.configService.get("onchainIntentsEnabled", { infer: true });
+    if (onchain) {
       await this.registerOnChain(intent);
     }
 
@@ -439,6 +465,18 @@ export class IntentsService implements OnModuleDestroy {
   }
 
   /**
+   * Advanced search with filtering, sorting and pagination (issue #440).
+   *
+   * Delegates to the repository's `search` so the filtering/sorting/pagination
+   * is pushed into the storage adapter (SQL for Prisma, in-memory for the
+   * dev/test backend). When no filters are present the result is identical to
+   * `getAll()` paginated — the default sort is `createdAt` descending.
+   */
+  async search(query: IntentSearchQuery): Promise<IntentSearchResult> {
+    return this.repo.search(query);
+  }
+
+  /**
    * Batch-fetch the current record for each of `ids` (issue #275).
    *
    * IDs are de-duplicated; IDs with no matching record are simply omitted from
@@ -506,13 +544,24 @@ export class IntentsService implements OnModuleDestroy {
    * unfairly slashed for a deadline that was never realistic.
    * Returns null when the intent is not found, not open, or past deadline.
    */
-  async acceptIfOpen(id: string, solver: string, now?: number): Promise<Intent | null> {
+  async acceptIfOpen(
+    id: string,
+    solver: string,
+    now?: number,
+    acceptedDstAmount?: string,
+  ): Promise<Intent | null> {
     const intent = await this.repo.findById(id);
     if (!intent) return null;
     const nowSec = now ?? Math.floor(Date.now() / 1000);
     const fillWindow =
       CHAIN_FILL_WINDOW_DEFAULTS[intent.srcChain] ?? DEFAULT_FILL_WINDOW_SECONDS;
-    const updated = await this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec);
+    const updated = await this.repo.acceptIfOpen(
+      id,
+      solver,
+      nowSec + fillWindow,
+      nowSec,
+      acceptedDstAmount,
+    );
     if (updated !== null) this.countTransition("open", "accepted");
     if (this.beginShadowObservation()) {
       this.observeAccept(updated ?? intent, solver, updated !== null);
@@ -533,9 +582,6 @@ export class IntentsService implements OnModuleDestroy {
         nativeToScVal(intent.deadline, { type: "u64" }),
       ]),
     );
-    const snapshot = this.protocolParamsService.snapshotForChain(intent.srcChain);
-    const fillWindow = snapshot.fillWindowSeconds;
-    return this.repo.acceptIfOpen(id, solver, nowSec + fillWindow, nowSec);
   }
 
   /**
@@ -562,6 +608,11 @@ export class IntentsService implements OnModuleDestroy {
       this.observeFill(id, solver, patch.fillAmount, patch.txHash, updated !== null);
     }
     return updated;
+  }
+
+  /** Reserve a tx hash once, atomically, before external verification begins. */
+  async reserveFillTxHash(id: string, solver: string, txHash: string): Promise<Intent | null> {
+    return this.repo.reserveFillTxHash(id, solver, txHash);
   }
 
   /** Shadow hook for `fill` — reported whether or not the conditional write won. */
@@ -653,7 +704,10 @@ export class IntentsService implements OnModuleDestroy {
       // An "accepted" intent always carries a solver. A record without one is
       // corrupt, so skip the simulation rather than encoding a null address —
       // the sweep loop already logs that case loudly.
-      if (subject?.solver) {
+      const slashedSolver = subject?.solver;
+      if (subject && slashedSolver) {
+      const solver = subject?.solver;
+      if (solver && subject) {
         this.reportShadow(
           "slash",
           subject.intentId,
@@ -661,7 +715,8 @@ export class IntentsService implements OnModuleDestroy {
           "slash_intent",
           this.safeArgs(() => [
             nativeToScVal(subject.intentId, { type: "string" }),
-            new Address(subject.solver).toScVal(),
+            new Address(slashedSolver).toScVal(),
+            new Address(solver).toScVal(),
             nativeToScVal(patch.slashReason, { type: "string" }),
             nativeToScVal(patch.slashedAt, { type: "u64" }),
           ]),

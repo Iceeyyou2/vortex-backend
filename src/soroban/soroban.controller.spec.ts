@@ -22,7 +22,14 @@ describe("SorobanController", () => {
   let controller: SorobanController;
 
   beforeEach(async () => {
-    jest.clearAllMocks();
+    // `reset`, not `clear`: `mockResolvedValueOnce` queues survive
+    // `clearAllMocks`, so a leftover one-shot from the previous test would be
+    // served before the rejection this test installs.
+    // `resetAllMocks`, not `clearAllMocks`: `clearAllMocks` only drops recorded
+    // calls and leaves queued `mockResolvedValueOnce` / `mockRejectedValueOnce`
+    // implementations in place, so a leftover value from an earlier test is
+    // served ahead of the one the current test queued.
+    jest.resetAllMocks();
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [SorobanController],
@@ -128,6 +135,8 @@ describe("SorobanController", () => {
     });
 
     it("passes a different publicKey correctly", async () => {
+      const anotherKey = "GBCI24BNYGGIRDE4PCUD6PJAQINUVQPIUJCBJT4HTZZONEXNVVDIYVAC";
+      mockSorobanService.getAccount.mockResolvedValueOnce({ id: anotherKey });
       mockSorobanService.getAccount.mockResolvedValueOnce({ id: OTHER_KEY });
 
       await controller.getAccount(OTHER_KEY);

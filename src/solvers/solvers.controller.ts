@@ -6,14 +6,21 @@ import {
   Get,
   NotFoundException,
   Param,
+  Patch,
   Post,
   Query,
 } from "@nestjs/common";
-import { ApiNotFoundResponse, ApiOperation, ApiQuery, ApiTags } from "@nestjs/swagger";
+import {
+  ApiNotFoundResponse,
+  ApiOperation,
+  ApiQuery,
+  ApiTags,
+} from "@nestjs/swagger";
+import { ConfigService } from "@nestjs/config";
 import { IntentsService } from "../intents/intents.service";
 import { IntentCapabilityIndex } from "../intents/solver-intent-matcher";
-import { buildDisputeMessage, verifyStellarSignature, buildSolverStatusMessage, buildRegisterMessage } from "../common/stellar-signature";
 import { SUPPORTED_CHAINS, SupportedChain } from "../intents/intents.types";
+import { ListIntentsDto } from "../intents/dto/list-intents.dto";
 import {
   buildDisputeMessage,
   buildRegisterMessage,
@@ -21,57 +28,23 @@ import {
   buildUpdateSolverMessage,
   verifyStellarSignature,
 } from "../common/stellar-signature";
+import { isCanaryIntent } from "../common/canary";
+import { AppConfig } from "../config/configuration";
 import { SolversService, LeaderboardWindow } from "./solvers.service";
-import { SolverRecord } from "./solvers.types";
+import { ListIntentsDto } from "../intents/dto/list-intents.dto";
+import { AppConfig } from "../config/configuration";
+import { isCanaryIntent } from "../common/canary";
+import { IntentCapabilityIndex } from "../intents/solver-intent-matcher";
 import { RegisterSolverDto } from "./dto/register-solver.dto";
 import { UpdateSolverDto } from "./dto/update-solver.dto";
 import { UpdateSolverStatusDto } from "./dto/update-solver-status.dto";
-import { ListIntentsDto } from "../intents/dto/list-intents.dto";
+import { SolverCredentialService } from "../auth/solver-credentials/solver-credential.service";
 
 const WINDOW_SECONDS: Record<Exclude<LeaderboardWindow, "all">, number> = {
   "24h": 24 * 60 * 60,
   "7d": 7 * 24 * 60 * 60,
   "30d": 30 * 24 * 60 * 60,
 };
-
-/**
- * Whether `solver` is able to work `chain`/`tokenSymbol` at all.
- *
- * A solver with no declared chains or tokens is treated as unrestricted — that
- * matches registration defaults, where the fields are optional declarations
- * of focus rather than a hard allow-list, and it keeps existing solvers
- * eligible for intents created before the fields existed.
- *
- * Matching is case-insensitive on the token symbol because registries and
- * user-supplied intent payloads disagree on casing (e.g. "USDC" vs "usdc").
- */
-function solverSupports(
-  solver: SolverRecord,
-  chain: string,
-  tokenSymbol: string,
-): boolean {
-  if (solver.supportedChains.length > 0) {
-    const supportsChain = solver.supportedChains.some(
-      (c: SupportedChain) => c.toLowerCase() === String(chain).toLowerCase(),
-    );
-    if (!supportsChain) return false;
-  }
-
-  if (solver.supportedTokens.length > 0) {
-    const needle = String(tokenSymbol).toLowerCase();
-    const supportsToken = solver.supportedTokens.some(
-      (t: string) => String(t).toLowerCase() === needle,
-    );
-    if (!supportsToken) return false;
-  }
-
-  return true;
-}
-
-/** Guard against chain values that are not part of the supported set. */
-function isSupportedChain(value: string): value is SupportedChain {
-  return (SUPPORTED_CHAINS as readonly string[]).includes(value);
-}
 
 @ApiTags("solvers")
 @Controller("api/v1/solvers")
@@ -80,7 +53,14 @@ export class SolversController {
     private readonly solversService: SolversService,
     private readonly intentsService: IntentsService,
     private readonly intentIndex: IntentCapabilityIndex,
-  ) {}
+    private readonly credentialService: SolverCredentialService,
+    config: ConfigService<AppConfig, true>,
+  ) {
+    this.canary = new Set(config.get("canaryAddresses", { infer: true }) ?? []);
+  }
+
+  /** Canary addresses (issue #496) — excluded from every leaderboard. */
+  private readonly canary: ReadonlySet<string>;
 
   @Post()
   async register(@Body() dto: RegisterSolverDto) {
@@ -138,8 +118,8 @@ export class SolversController {
   @ApiQuery({ name: "window", required: false, enum: ["24h", "7d", "30d", "all"], description: "Time window over which to compute rankings." })
   async getLeaderboard(@Query("window") window: string = "all") {
     const resolvedWindow = this.normalizeWindow(window);
-    const solvers = await this.solversService.getAll();
-    const intents = await this.intentsService.getAll();
+    const solvers = (await this.solversService.getAll()).filter((s) => !this.canary.has(s.address));
+    const intents = (await this.intentsService.getAll()).filter((i) => !isCanaryIntent(i, this.canary));
     const now = Math.floor(Date.now() / 1000);
     const cutoff = resolvedWindow === "all" ? 0 : now - WINDOW_SECONDS[resolvedWindow];
 
@@ -197,9 +177,9 @@ export class SolversController {
 
   @Get()
   async getLegacyLeaderboard() {
-    const solvers = (await this.solversService.getAll()).sort(
-      (a, b) => b.fillsCompleted - a.fillsCompleted,
-    );
+    const solvers = (await this.solversService.getAll())
+      .filter((s) => !this.canary.has(s.address))
+      .sort((a, b) => b.fillsCompleted - a.fillsCompleted);
     return { solvers, count: solvers.length };
   }
 
@@ -212,12 +192,6 @@ export class SolversController {
     // Use the capability index for O(supported-chains × supported-tokens)
     // lookup instead of scanning all open intents (issue #436).
     const eligible = this.intentIndex.getEligibleFor(solver);
-    const open = await this.intentsService.getByState("open");
-    const eligible = open.filter(
-      (intent) =>
-        isSupportedChain(intent.srcChain) &&
-        solverSupports(solver, intent.srcChain, intent.srcToken.symbol),
-    );
 
     const limit = Math.min(dto.limit ?? 20, 100);
     const offset = dto.offset ?? 0;
@@ -346,6 +320,8 @@ export class SolversController {
 
     const solver = await this.solversService.deregister(address);
     if (!solver) throw new NotFoundException("Solver not found");
+    // Issue #443 — instantly disable every credential of the deregistered solver.
+    await this.credentialService.disableAllForSolver(address);
     return {
       ...solver,
       withdrawalStatus: "pending",
@@ -359,6 +335,8 @@ export class SolversController {
 
     const solver = await this.solversService.deactivate(address);
     if (!solver) throw new NotFoundException("Solver not found");
+    // Issue #443 — instantly disable every credential of the deactivated solver.
+    await this.credentialService.disableAllForSolver(address);
     return solver;
   }
 

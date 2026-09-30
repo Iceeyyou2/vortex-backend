@@ -394,7 +394,9 @@ describe("IntentsService", () => {
       expect(call.contractId).toBe(VALID_CONTRACT_ID);
       expect(call.method).toBe("create_intent");
 
-      // response shape is unchanged relative to the in-memory path
+      // Response shape: the in-memory and on-chain paths return the same keys.
+      // usdValueAtCreate (#440) and paramsVersion (#500) are both stamped by
+      // persistNewIntent, so they appear on every newly created intent.
       expect(Object.keys(intent).sort()).toEqual(
         Object.keys({
           intentId: "",
@@ -407,6 +409,8 @@ describe("IntentsService", () => {
           state: "",
           createdAt: 0,
           deadline: 0,
+          paramsVersion: 0,
+          usdValueAtCreate: 0,
         }).sort(),
       );
       expect(await svc.get(intent.intentId)).toBeDefined();
@@ -414,14 +418,14 @@ describe("IntentsService", () => {
 
     it("rejects with a clear error and does not create the intent when SETTLEMENT_CONTRACT_ID is unset", async () => {
       const stellarTxService = fakeStellarTxService();
-      const svc = makeService({ onchainIntentsEnabled: true }, stellarTxService);
-      const before = (await svc.getAll()).length;
+      const service = makeService({ onchainIntentsEnabled: true }, stellarTxService);
+      const before = (await service.getAll()).length;
 
-      await expect(svc.create(validCreateData())).rejects.toMatchObject({
+      await expect(service.create(validCreateData())).rejects.toMatchObject({
         message: expect.stringContaining("SETTLEMENT_CONTRACT_ID"),
       });
       expect(stellarTxService.invokeContract).not.toHaveBeenCalled();
-      expect(await svc.getAll()).toHaveLength(before);
+      expect(await service.getAll()).toHaveLength(before);
     });
 
     it("rejects and does not create the intent when the on-chain call fails", async () => {

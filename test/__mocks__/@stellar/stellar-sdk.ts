@@ -25,6 +25,10 @@ import * as path from "node:path";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const real: any = require(
+  // __dirname is <root>/test/__mocks__/@stellar, so the repo root is two levels
+  // up ("../..") — three levels overshoots the repo and makes `real` undefined,
+  // which surfaces far away as "Cannot read properties of undefined (reading
+  // 'Server')" inside every e2e suite that boots the Nest app.
   path.join(__dirname, "..", "..", "..", "node_modules", "@stellar", "stellar-sdk", "lib", "index.js"),
 );
 
@@ -57,13 +61,15 @@ const mockServer = {
   sendTransaction: jest.fn().mockResolvedValue({ status: "SUCCESS", hash: "mock-hash" }),
 };
 
+const mockServerClass = jest.fn().mockImplementation(() => mockServer);
+
 /**
  * Network stub. `Api` is spread from the real module so type guards such as
  * `SorobanRpc.Api.isSimulationError` keep working exactly as in production.
  */
 export const SorobanRpc = {
   ...real.SorobanRpc,
-  Server: jest.fn().mockImplementation(() => mockServer),
+  Server: mockServerClass,
   Api: {
     ...real.SorobanRpc?.Api,
     isSimulationError: (response: unknown): boolean =>
@@ -85,6 +91,8 @@ export const Keypair = real.Keypair;
 export const Networks = real.Networks;
 export const StrKey = real.StrKey;
 export const Address = real.Address;
+export const Asset = real.Asset;
+export const Horizon = real.Horizon;
 export const Contract = real.Contract;
 export const Account = real.Account;
 export const Operation = real.Operation;
@@ -95,6 +103,12 @@ export const xdr = real.xdr;
 export const nativeToScVal = real.nativeToScVal;
 export const scValToNative = real.scValToNative;
 export const BASE_FEE = real.BASE_FEE;
+// Namespaced clients used by production code (e.g. TreasuryService builds
+// `new StellarSdk.Horizon.Server(...)`). Without these the mock leaves
+// `StellarSdk.Horizon` undefined and every e2e suite that boots the app fails.
+export const Horizon = real.Horizon;
+export const Utils = real.Utils;
+export const Config = real.Config;
 export const MuxedAccount = real.MuxedAccount;
 export const hash = real.hash;
 export const Memo = real.Memo;
